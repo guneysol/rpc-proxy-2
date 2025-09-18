@@ -39,6 +39,10 @@ export default {
 		const { search } = new URL(request.url);
 		const upstreamUrl = `wss://mainnet.helius-rpc.com${search ? `${search}&` : '?'}api-key=${env.HELIUS_API_KEY}`;
 		
+		// Extract subprotocol from client request
+		const clientProtocols = request.headers.get('Sec-WebSocket-Protocol');
+		const selectedProtocol = clientProtocols ? clientProtocols.split(',')[0].trim() : undefined;
+		
 		// Create WebSocket pair
 		const webSocketPair = new WebSocketPair();
 		const [client, server] = Object.values(webSocketPair);
@@ -46,44 +50,118 @@ export default {
 		// Accept the client connection
 		server.accept();
 		
-		// Connect to upstream WebSocket
-		const upstream = new WebSocket(upstreamUrl);
+		// Connect to upstream WebSocket with subprotocol if present
+		const upstream = selectedProtocol 
+			? new WebSocket(upstreamUrl, [selectedProtocol])
+			: new WebSocket(upstreamUrl);
+		
+		// Keepalive timer - send heartbeat every 20 seconds to upstream only
+		let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+		
+		const startKeepalive = () => {
+			keepaliveTimer = setInterval(() => {
+				if (upstream.readyState === WebSocket.OPEN) {
+					try {
+						upstream.send(JSON.stringify({
+							"jsonrpc": "2.0",
+							"method": "helius_keepalive"
+						}));
+					} catch (error) {
+						// If keepalive fails, connection is likely broken
+						clearKeepalive();
+					}
+				} else {
+					clearKeepalive();
+				}
+			}, 20000);
+		};
+		
+		const clearKeepalive = () => {
+			if (keepaliveTimer) {
+				clearInterval(keepaliveTimer);
+				keepaliveTimer = null;
+			}
+		};
+		
+		// Start keepalive once upstream connection is open
+		upstream.addEventListener('open', () => {
+			startKeepalive();
+		});
 		
 		// Forward messages from client to upstream
 		server.addEventListener('message', event => {
 			if (upstream.readyState === WebSocket.OPEN) {
-				upstream.send(event.data);
+				try {
+					upstream.send(event.data);
+				} catch (error) {
+					// Error sending to upstream, close client with error code
+					clearKeepalive();
+					try {
+						server.close(1011, "upstream_ws_error");
+					} catch {}
+				}
 			}
 		});
 		
 		// Forward messages from upstream to client
 		upstream.addEventListener('message', event => {
 			if (server.readyState === WebSocket.OPEN) {
-				server.send(event.data);
+				try {
+					server.send(event.data);
+				} catch (error) {
+					// Error sending to client, close upstream with error code
+					clearKeepalive();
+					try {
+						upstream.close(1011, "client_ws_error");
+					} catch {}
+				}
 			}
 		});
 		
-		// Handle connection close
-		server.addEventListener('close', () => {
-			upstream.close();
+		// Handle connection close - propagate close codes and reasons
+		server.addEventListener('close', (event) => {
+			clearKeepalive();
+			try {
+				const closeCode = event.code || 1000;
+				const closeReason = event.reason || "client_closed";
+				upstream.close(closeCode, closeReason);
+			} catch {}
 		});
 		
-		upstream.addEventListener('close', () => {
-			server.close();
+		upstream.addEventListener('close', (event) => {
+			clearKeepalive();
+			try {
+				const closeCode = event.code || 1011;
+				const closeReason = event.reason || "upstream_closed";
+				server.close(closeCode, closeReason);
+			} catch {}
 		});
 		
-		// Handle errors
+		// Handle errors - close opposite side with error code 1011
 		server.addEventListener('error', () => {
-			upstream.close();
+			clearKeepalive();
+			try {
+				upstream.close(1011, "client_ws_error");
+			} catch {}
 		});
 		
 		upstream.addEventListener('error', () => {
-			server.close();
+			clearKeepalive();
+			try {
+				server.close(1011, "upstream_ws_error");
+			} catch {}
 		});
+		
+		// Prepare response headers with subprotocol if negotiated
+		const responseHeaders: Record<string, string> = {};
+		if (selectedProtocol) {
+			responseHeaders['Sec-WebSocket-Protocol'] = selectedProtocol;
+		}
 		
 		return new Response(null, {
 			status: 101,
 			webSocket: client,
+			headers: responseHeaders,
 		});
 	}
 
